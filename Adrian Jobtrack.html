@@ -136,6 +136,11 @@ button,input,select,textarea{font:inherit;color:inherit}
 .menu button.danger{color:var(--danger)}
 .menu hr{border:0;border-top:1px solid var(--border);margin:6px 0}
 .menu .menu-note{font-size:11px;color:var(--muted);padding:4px 10px 2px}
+.sync-slot{display:inline-flex}
+.sync-slot:empty{display:none}
+body .cs-root{--cs-surface:var(--surface);--cs-surface2:var(--surface-2);--cs-border:var(--border);--cs-text:var(--text);--cs-muted:var(--muted);--cs-accent:var(--primary);--cs-ink:#fff;--cs-danger:var(--danger)}
+.sync-slot .cs-pill{padding:5px 10px;border-radius:999px;font-size:12px}
+@media (max-width:640px){ .sync-slot .cs-pill .cs-label{display:none} .sync-slot .cs-pill{padding:0;width:34px;height:34px;justify-content:center} }
 
 /* ================= Layout ================= */
 .container{max-width:1440px;width:100%;margin:0 auto;padding:20px;flex:1}
@@ -517,6 +522,7 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13px;min-width:980px}
     </nav>
     <div class="appbar-actions">
       <span id="saveStatus" class="save-status" role="status" aria-live="polite"><span class="dot"></span><span class="txt">Saved</span></span>
+      <span id="syncSlot" class="sync-slot"></span>
       <button class="icon-btn" id="themeToggle" type="button" aria-label="Toggle light or dark theme" title="Toggle light / dark theme"></button>
       <div class="menu-wrap">
         <button class="btn btn-ghost" id="dataMenuBtn" type="button" aria-haspopup="true" aria-expanded="false">Data <span aria-hidden="true">▾</span></button>
@@ -525,10 +531,11 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13px;min-width:980px}
           <button type="button" role="menuitem" data-action="import">Import JSON backup…</button>
           <hr>
           <button type="button" role="menuitem" data-action="cv-manage">CV folder…</button>
+          <button type="button" role="menuitem" data-action="cloud-sync">Cloud sync (phone ↔ computer)…</button>
           <hr>
           <button type="button" role="menuitem" data-action="reset-sample">Reset to sample data…</button>
           <button type="button" role="menuitem" data-action="clear-all" class="danger">Clear all data…</button>
-          <div class="menu-note">Data is stored only in this browser.</div>
+          <div class="menu-note">Data is stored in this browser. Sign in to Cloud sync to share it with your other devices.</div>
         </div>
       </div>
     </div>
@@ -635,6 +642,517 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13px;min-width:980px}
 <input type="file" id="importFile" accept="application/json,.json" hidden>
 <noscript><p style="padding:20px;text-align:center">Adrian Jobtrack needs JavaScript enabled to run.</p></noscript>
 
+<script>
+/* CloudSync engine (firebase-realtime-sync) */
+/* ============================================================
+   CloudSync v1 — real-time sync of an app's state between devices
+   (Firebase Auth email/password + Cloud Firestore, loaded from gstatic).
+
+   The app state is split into documents at users/{uid}/parts/{key}.
+   Each document holds the JSON in `j`, the client time of the edit in `t`
+   and the device id in `dev`. Every signed-in device listens to that
+   collection, so an edit shows up on the others within a second or two.
+   meta.base[key] = {l: local hash, c: cloud hash} remembers the version this
+   device last agreed with the cloud; after offline edits it tells which side
+   changed, and the newer edit wins (per document).
+
+   Usage (see references/integration.md):
+     CloudSync.init({
+       firebaseConfig: {...}, appName: 'My App',
+       getState: () => state, setState: s => { state = s; saveLocal(); },
+       render: () => render(),
+       split, join, localOnly, describe, mount, isBusy, migrate,
+     });
+     CloudSync.changed();   // after every local save
+   ============================================================ */
+(function () {
+  'use strict';
+  const SDK_VERSION = '10.12.2';
+  const MAX_DOC = 1000000; // Firestore allows 1 MiB per document
+  const LABEL = {
+    off: 'Sign in to sync', connecting: 'Connecting…', link: 'Finish cloud setup', synced: 'Synced', saving: 'Saving…',
+    offline: 'Offline — will sync later', error: 'Sync error', unavailable: 'Cloud sync unavailable',
+  };
+
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const rid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
+  function strHash(s) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0).toString(36) + '.' + s.length;
+  }
+  const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } };
+  // dot paths for localOnly: 'settings.activeTab'
+  const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? undefined : a[k]), o);
+  function delPath(o, p) { const ks = p.split('.'), last = ks.pop(); const t = ks.reduce((a, k) => (a == null ? undefined : a[k]), o); if (t && typeof t === 'object') delete t[last]; }
+  function setPath(o, p, v) { const ks = p.split('.'), last = ks.pop(); let t = o; for (const k of ks) { if (t[k] == null || typeof t[k] !== 'object') t[k] = {}; t = t[k]; } t[last] = v; }
+  // Firestore document ids cannot contain "/" and cannot be "." or ".."
+  const docId = k => encodeURIComponent(k).replace(/\./g, '%2E');
+  const keyOf = id => decodeURIComponent(id);
+
+  const CSS = `
+.cs-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:10px;border:1px solid var(--cs-border);background:var(--cs-surface2);color:var(--cs-muted);font-family:inherit;font-size:12px;font-weight:600;line-height:1.2;cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+.cs-pill:hover{color:var(--cs-text)}
+.cs-pill[data-compact]{padding:0;width:40px;height:40px;justify-content:center;border:0;background:transparent}
+.cs-pill[data-compact] .cs-label{display:none}
+.cs-float{position:fixed;z-index:9000;top:calc(10px + env(safe-area-inset-top));right:calc(10px + env(safe-area-inset-right));box-shadow:0 4px 16px rgba(0,0,0,.25)}
+.cs-dot{width:9px;height:9px;border-radius:50%;background:var(--cs-muted);flex:none;display:inline-block}
+[data-cs-state="synced"] .cs-dot{background:#3ddc97}
+[data-cs-state="saving"] .cs-dot,[data-cs-state="connecting"] .cs-dot{background:#ffc547;animation:csPulse 1s ease-in-out infinite}
+[data-cs-state="error"] .cs-dot,[data-cs-state="unavailable"] .cs-dot{background:#ff5d5d}
+[data-cs-state="link"] .cs-dot{background:#5ab0ff}
+@keyframes csPulse{50%{opacity:.35}}
+.cs-root{--cs-surface:var(--surface,#16181c);--cs-surface2:var(--surface2,#1e2127);--cs-border:var(--border,#2a2e36);--cs-text:var(--text,#eef0f3);--cs-muted:var(--muted,#8b919c);--cs-accent:var(--accent,#c6ff3d);--cs-ink:var(--accent-ink,#0e0f11);--cs-danger:var(--danger,#ff5d5d)}
+.cs-backdrop{position:fixed;inset:0;z-index:9500;background:rgba(0,0,0,.6);display:grid;place-items:center;padding:16px;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;animation:csFade .15s ease-out}
+.cs-modal{background:var(--cs-surface);color:var(--cs-text);border:1px solid var(--cs-border);border-radius:16px;width:100%;max-width:460px;max-height:calc(100dvh - 32px);display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.cs-head{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--cs-border)}
+.cs-head b{font-size:15px}
+.cs-x{border:0;background:transparent;color:var(--cs-muted);font-size:22px;line-height:1;cursor:pointer;width:36px;height:36px}
+.cs-body{padding:16px;overflow:auto;display:grid;gap:12px}
+.cs-body p{margin:0}
+.cs-small{font-size:12px;color:var(--cs-muted)}
+.cs-field{display:grid;gap:6px}
+.cs-field span{font-size:11px;font-weight:600;color:var(--cs-muted);text-transform:uppercase;letter-spacing:.7px}
+.cs-input{background:var(--cs-surface2);border:1px solid var(--cs-border);color:var(--cs-text);border-radius:10px;padding:0 12px;height:44px;font:inherit;font-size:16px;width:100%;box-sizing:border-box;outline:none}
+.cs-input:focus{border-color:var(--cs-accent)}
+.cs-err{color:var(--cs-danger);font-size:13px;min-height:18px}
+.cs-foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--cs-border);flex-wrap:wrap}
+.cs-btn{display:inline-flex;align-items:center;justify-content:center;height:42px;padding:0 14px;border-radius:10px;border:1px solid var(--cs-border);background:var(--cs-surface2);color:var(--cs-text);font:inherit;font-weight:600;cursor:pointer;touch-action:manipulation}
+.cs-btn.primary{background:var(--cs-accent);color:var(--cs-ink);border-color:transparent}
+.cs-btn.danger{background:transparent;color:var(--cs-danger)}
+.cs-btn.link{border:0;background:transparent;color:var(--cs-muted);height:auto;padding:0;font-size:13px}
+.cs-btn.left{margin-right:auto}
+.cs-toasts{position:fixed;z-index:9600;left:50%;transform:translateX(-50%);bottom:calc(84px + env(safe-area-inset-bottom));display:grid;gap:8px;width:max-content;max-width:calc(100vw - 32px)}
+.cs-toast{background:var(--cs-text);color:var(--cs-surface);padding:10px 14px;border-radius:12px;font:600 13px/1.4 system-ui,-apple-system,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.3);animation:csFade .2s}
+.cs-toast.error{background:var(--cs-danger);color:#fff}
+@keyframes csFade{from{opacity:0}}
+@media (max-width:640px){
+  .cs-backdrop{place-items:end center;padding:max(12px,env(safe-area-inset-top)) 0 0}
+  .cs-modal{max-width:none;border-radius:18px 18px 0 0;border-bottom:0;max-height:calc(100dvh - max(12px,env(safe-area-inset-top)))}
+  .cs-foot{padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+  .cs-foot .cs-btn{flex:1 1 auto;height:46px}
+  .cs-foot .cs-btn.left{flex:0 0 auto}
+}`;
+
+  const CloudSync = {
+    opts: null, fs: null, authApi: null, auth: null, db: null, user: null, unsub: null,
+    state: 'off', merged: false, merging: false, applying: false, linking: false, timer: null, pending: 0,
+    inflight: {}, tooBig: {}, cloudSnapshot: null, pendingRender: false, lastSync: null, lastError: '',
+    meta: { uid: null, linked: false, base: {}, lt: {} }, dev: null, ns: 'cs',
+
+    /* ---------- setup ---------- */
+    init(opts) {
+      if (this.opts) return this;
+      if (!opts || !opts.firebaseConfig || !opts.getState || !opts.setState) throw new Error('CloudSync.init needs firebaseConfig, getState and setState');
+      this.opts = { localOnly: [], sdk: 'https://www.gstatic.com/firebasejs/' + SDK_VERSION + '/', ...opts };
+      this.ns = 'cs.' + (opts.storageKey || opts.firebaseConfig.projectId || 'app');
+      this.dev = lsGet(this.ns + '.device') || rid(); lsSet(this.ns + '.device', this.dev);
+      this.injectCSS(); this.mountPills();
+      window.addEventListener('online', () => { this.push(); this.settle(); });
+      window.addEventListener('offline', () => { if (this.user) this.setState('offline'); });
+      setInterval(() => { if (this.pendingRender) this.rerender(); }, 1000);
+      this.setState('off');
+      if (!opts.manualStart) this.start();
+      return this;
+    },
+    injectCSS() {
+      if (document.getElementById('cs-style')) return;
+      const st = document.createElement('style'); st.id = 'cs-style'; st.textContent = CSS; document.head.appendChild(st);
+    },
+    mountPills() {
+      const m = this.opts.mount;
+      let els = [];
+      if (m === false) return;
+      if (typeof m === 'string') els = [...document.querySelectorAll(m)];
+      else if (m && m.nodeType) els = [m];
+      else if (Array.isArray(m)) els = m.flatMap(x => (typeof x === 'string' ? [...document.querySelectorAll(x)] : [x]));
+      const mk = (host, float) => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'cs-pill cs-root' + (float ? ' cs-float' : ''); b.dataset.csPill = '';
+        if (float || (host && host.hasAttribute && host.hasAttribute('data-cs-compact'))) b.dataset.compact = '';
+        b.innerHTML = '<i class="cs-dot"></i><span class="cs-label"></span>';
+        b.addEventListener('click', () => this.open());
+        (host || document.body).appendChild(b);
+      };
+      if (els.length) els.forEach(h => mk(h, false)); else mk(null, true);
+    },
+
+    /* ---------- bookkeeping ---------- */
+    loadMeta(id) {
+      let m = null;
+      try { m = JSON.parse(lsGet(this.ns + '.meta') || 'null'); } catch (e) {}
+      this.meta = m && m.uid === id ? { linked: false, base: {}, lt: {}, ...m } : { uid: id, linked: false, base: {}, lt: {} };
+    },
+    saveMeta() { lsSet(this.ns + '.meta', JSON.stringify(this.meta)); },
+    // A copy of the app state without the per-device keys.
+    sharedCopy() {
+      const c = JSON.parse(JSON.stringify(this.opts.getState() || {}));
+      this.opts.localOnly.forEach(p => delPath(c, p));
+      return c;
+    },
+    // The app state as documents: key -> { h: hash, s(): JSON string }.
+    parts() {
+      const c = this.sharedCopy();
+      const obj = this.opts.split ? this.opts.split(c) : c;
+      const out = {};
+      Object.keys(obj || {}).forEach(k => { if (obj[k] === undefined) return; const s = JSON.stringify(obj[k]); out[k] = { h: strHash(s), s: () => s }; });
+      return out;
+    },
+    // Rebuild the app state from parsed documents, keeping this device's local-only keys.
+    assemble(cur) {
+      let s = this.opts.join ? this.opts.join(cur) : { ...cur };
+      const now = this.opts.getState() || {};
+      this.opts.localOnly.forEach(p => { const v = getPath(now, p); if (v !== undefined) setPath(s, p, v); });
+      if (this.opts.migrate) s = this.opts.migrate(s) || s;
+      return s;
+    },
+    describe(state) {
+      if (this.opts.describe) { try { return this.opts.describe(state); } catch (e) {} }
+      const n = Object.keys(state || {}).length;
+      return n + ' section' + (n === 1 ? '' : 's');
+    },
+
+    /* ---------- applying cloud changes ---------- */
+    async applyRemote(changes) {
+      if (!changes.length) return;
+      this.applying = true;
+      try {
+        const P = this.parts(), cur = {};
+        Object.keys(P).forEach(k => { cur[k] = JSON.parse(P[k].s()); });
+        changes.forEach(c => { if (c.j == null) delete cur[c.k]; else cur[c.k] = JSON.parse(c.j); });
+        await this.opts.setState(this.assemble(cur));
+      } finally { this.applying = false; }
+      const P = this.parts();
+      changes.forEach(c => {
+        if (c.j == null) delete this.meta.base[c.k];
+        else this.meta.base[c.k] = { l: P[c.k] ? P[c.k].h : '', c: strHash(c.j) };
+        this.meta.lt[c.k] = c.t || 0;
+      });
+      this.saveMeta();
+      this.rerender();
+    },
+    busy() {
+      if (this.opts.isBusy) { try { return !!this.opts.isBusy(); } catch (e) {} }
+      const a = document.activeElement;
+      return !!(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && !a.closest('.cs-backdrop')) || (a && a.isContentEditable);
+    },
+    // Re-render for remote changes, but never while the user is typing.
+    rerender() {
+      if (!this.opts.render) return;
+      if (this.busy()) { this.pendingRender = true; return; }
+      this.pendingRender = false;
+      try { this.opts.render(); } catch (e) { console.warn('CloudSync: render failed', e); }
+    },
+
+    /* ---------- pushing local changes ---------- */
+    changed() { this.queue(); },
+    queue() {
+      if (!this.merged || this.applying) return;
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.push(), 500);
+    },
+    push() {
+      clearTimeout(this.timer);
+      if (!this.merged || !this.user || this.applying) return;
+      const P = this.parts(), B = this.meta.base, now = Date.now();
+      const sets = Object.keys(P).filter(k => (!B[k] || B[k].l !== P[k].h) && this.inflight[k] !== P[k].h);
+      const dels = Object.keys(B).filter(k => !P[k] && this.inflight[k] !== 'del');
+      if (!sets.length && !dels.length) return;
+      const { doc, setDoc, deleteDoc } = this.fs;
+      const ref = k => doc(this.db, 'users', this.user.uid, 'parts', docId(k));
+      const run = (k, tag, promise, done) => {
+        this.inflight[k] = tag; this.pending++;
+        this.setState(navigator.onLine === false ? 'offline' : 'saving');
+        promise.then(done).catch(e => this.fail(e)).finally(() => { if (this.inflight[k] === tag) delete this.inflight[k]; this.pending--; this.settle(); });
+      };
+      sets.forEach(k => {
+        const h = P[k].h, j = P[k].s();
+        if (j.length > MAX_DOC) {
+          if (!this.tooBig[k]) { this.tooBig[k] = 1; this.toast(`"${k}" is over 1 MB and cannot sync — it stays on this device only.`, 'error'); }
+          return;
+        }
+        this.meta.lt[k] = now;
+        run(k, h, setDoc(ref(k), { j, t: now, dev: this.dev }), () => { this.meta.base[k] = { l: h, c: strHash(j) }; this.saveMeta(); });
+      });
+      dels.forEach(k => {
+        this.meta.lt[k] = now;
+        run(k, 'del', deleteDoc(ref(k)), () => { delete this.meta.base[k]; this.saveMeta(); });
+      });
+      this.saveMeta();
+    },
+    settle() {
+      if (this.pending > 0 || !this.user || !this.merged) return;
+      this.lastSync = new Date();
+      if (this.state !== 'error') this.setState(navigator.onLine === false ? 'offline' : 'synced');
+    },
+    fail(e) {
+      console.warn('Cloud sync error:', e);
+      this.lastError = e && e.code === 'permission-denied' ? 'The cloud refused the request (permission-denied). Check the Firestore rules.' : String((e && (e.code || e.message)) || e);
+      this.setState('error');
+    },
+
+    /* ---------- connecting ---------- */
+    async start() {
+      if (this.fs) return;
+      this.setState('connecting');
+      try {
+        const sdk = this.opts.sdk;
+        const [appMod, authMod, fsMod] = await Promise.all(['firebase-app.js', 'firebase-auth.js', 'firebase-firestore.js'].map(f => import(sdk + f)));
+        this.fs = fsMod; this.authApi = authMod;
+        const app = appMod.initializeApp(this.opts.firebaseConfig, 'cloudsync');
+        this.auth = authMod.initializeAuth(app, { persistence: [authMod.indexedDBLocalPersistence, authMod.browserLocalPersistence, authMod.inMemoryPersistence] });
+        this.db = fsMod.initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+        authMod.onAuthStateChanged(this.auth, u => this.onUser(u));
+      } catch (e) {
+        console.warn('Cloud sync unavailable:', e);
+        this.fs = null;
+        this.setState('unavailable');
+      }
+    },
+    onUser(u) {
+      if (this.unsub) { this.unsub(); this.unsub = null; }
+      this.user = u || null; this.merged = false; this.cloudSnapshot = null; this.lastError = '';
+      if (!u) { this.setState('off'); return; }
+      this.loadMeta(u.uid);
+      this.setState('connecting');
+      const col = this.fs.collection(this.db, 'users', u.uid, 'parts');
+      this.unsub = this.fs.onSnapshot(col, snap => this.onSnap(snap), e => this.fail(e));
+    },
+    onSnap(snap) {
+      if (!this.merged) {
+        if (snap.metadata.fromCache) return; // wait for the server's answer
+        const cloud = {};
+        snap.forEach(d => { const v = d.data(); cloud[keyOf(d.id)] = { j: v.j, t: v.t || 0 }; });
+        this.cloudSnapshot = cloud;
+        if (!this.meta.linked) { this.setState('link'); this.linkDialog(); }
+        else if (!this.merging) { this.merging = true; this.firstMerge(cloud).finally(() => { this.merging = false; }); }
+        return;
+      }
+      const changes = [];
+      snap.docChanges().forEach(ch => {
+        const d = ch.doc;
+        if (d.metadata.hasPendingWrites) return; // our own write echoing back
+        const k = keyOf(d.id), b = this.meta.base[k];
+        if (ch.type === 'removed') { if (b) changes.push({ k, j: null, t: Date.now() }); return; }
+        const v = d.data();
+        if (b && b.c === strHash(v.j)) return; // already have this version
+        changes.push({ k, j: v.j, t: v.t || 0 });
+      });
+      if (!changes.length) return;
+      const P = this.parts();
+      // keep a local edit that is newer than the incoming one; push() sends it afterwards
+      const take = changes.filter(c => {
+        const b = this.meta.base[c.k], L = P[c.k];
+        const editedHere = L ? (!b || b.l !== L.h) : !!b;
+        return !editedHere || (c.t || 0) >= (this.meta.lt[c.k] || 0);
+      });
+      this.applyRemote(take).then(() => { this.queue(); this.settle(); });
+    },
+    // Reconcile after this device was offline or closed: per document, whichever side changed wins.
+    async firstMerge(cloud) {
+      const P = this.parts(), B = this.meta.base, lt = this.meta.lt;
+      const take = [];
+      new Set([...Object.keys(P), ...Object.keys(cloud), ...Object.keys(B)]).forEach(k => {
+        const L = P[k], C = cloud[k], b = B[k], cH = C ? strHash(C.j) : null;
+        if (L && C) {
+          if (L.h === cH) { B[k] = { l: L.h, c: cH }; return; }
+          const editedHere = !b || b.l !== L.h, editedThere = !b || b.c !== cH;
+          if (!editedHere && editedThere) take.push({ k, j: C.j, t: C.t });
+          else if (editedHere && editedThere && (C.t || 0) > (lt[k] || 0)) take.push({ k, j: C.j, t: C.t });
+        } else if (C) {
+          if (!b || (b.c !== cH && (C.t || 0) > (lt[k] || 0))) take.push({ k, j: C.j, t: C.t }); // else: deleted here, push() deletes it
+        } else if (L) {
+          if (b && b.l === L.h) take.push({ k, j: null, t: Date.now() }); // deleted on another device
+        } else delete B[k];
+      });
+      await this.applyRemote(take);
+      this.merged = true;
+      this.push();
+      this.settle();
+    },
+
+    /* ---------- first sign-in on a device ---------- */
+    linkDialog() {
+      if (this.linking || !this.cloudSnapshot) return;
+      this.linking = true;
+      const cloud = this.cloudSnapshot, done = () => { this.linking = false; };
+      const here = this.describe(this.opts.getState());
+      if (!Object.keys(cloud).length) {
+        this.dialog({
+          title: 'Set up cloud sync', onClose: done,
+          body: `<p>Your cloud is empty. Upload this device's data so your other devices can use it?</p><p class="cs-small">This device: ${esc(here)}.</p>`,
+          actions: [{ label: 'Not now', onClick: done }, { label: 'Upload to cloud', cls: 'primary', onClick: () => { done(); this.useLocal(); } }],
+        });
+        return;
+      }
+      let there = Object.keys(cloud).length + ' parts';
+      try { const cur = {}; Object.keys(cloud).forEach(k => { cur[k] = JSON.parse(cloud[k].j); }); there = this.describe(this.assemble(cur)); } catch (e) {}
+      this.dialog({
+        title: 'Cloud data found', onClose: done,
+        body: `<p>Your cloud already has data: <b>${esc(there)}</b>.</p><p>This device has ${esc(here)}.</p>
+          <p class="cs-small">Pick the copy to keep; the other is replaced. Using the cloud data is right for a new phone or browser. A backup of this device's data is kept in the browser either way.</p>`,
+        actions: [
+          { label: 'Replace cloud with this device', cls: 'danger left', onClick: () => { done(); this.confirmReplaceCloud(); } },
+          { label: 'Use cloud data here', cls: 'primary', onClick: () => { done(); this.useCloud(); } },
+        ],
+      });
+    },
+    confirmReplaceCloud() {
+      this.dialog({
+        title: 'Replace cloud data?', onClose: () => this.linkDialog(),
+        body: '<p>This overwrites the data in your cloud — and so on every other device — with this device\'s data.</p>',
+        actions: [{ label: 'Cancel', onClick: () => this.linkDialog() }, { label: 'Replace cloud', cls: 'primary', onClick: () => this.useLocal() }],
+      });
+    },
+    backupLocal() { lsSet(this.ns + '.backup', JSON.stringify(this.opts.getState())); },
+    async useCloud() {
+      this.backupLocal();
+      const cloud = this.cloudSnapshot || {}, P = this.parts();
+      const changes = Object.keys(cloud).map(k => ({ k, j: cloud[k].j, t: cloud[k].t }));
+      Object.keys(P).forEach(k => { if (!cloud[k]) changes.push({ k, j: null, t: 0 }); });
+      this.meta.base = {}; this.meta.lt = {};
+      await this.applyRemote(changes);
+      this.meta.linked = true; this.saveMeta();
+      this.merged = true;
+      this.push(); this.settle();
+      this.toast('Cloud data loaded on this device');
+    },
+    useLocal() {
+      this.backupLocal();
+      const cloud = this.cloudSnapshot || {};
+      this.meta.base = {}; this.meta.lt = {};
+      // every cloud document gets overwritten or, if this device doesn't have it, deleted
+      Object.keys(cloud).forEach(k => { this.meta.base[k] = { l: '', c: strHash(cloud[k].j) }; });
+      this.meta.linked = true; this.saveMeta();
+      this.merged = true;
+      this.push(); this.settle();
+      this.toast('Uploading this device\'s data…');
+    },
+
+    /* ---------- UI ---------- */
+    setState(s) {
+      this.state = s;
+      const label = LABEL[s] || s;
+      document.querySelectorAll('[data-cs-pill]').forEach(p => {
+        p.dataset.csState = s;
+        p.querySelector('.cs-label').textContent = s === 'error' ? 'Sync error — tap for details' : label;
+        p.title = this.user ? `${label} · ${this.user.email}` : label;
+        p.setAttribute('aria-label', 'Cloud sync: ' + label);
+      });
+      if (this.opts && this.opts.onStatus) { try { this.opts.onStatus(s, label, this.user); } catch (e) {} }
+      const info = document.getElementById('cs-info');
+      if (info && this.user) info.innerHTML = this.infoHTML();
+    },
+    label() { return LABEL[this.state] || this.state; },
+    infoHTML() {
+      return `<div>Signed in as <b>${esc(this.user.email)}</b></div>
+        <div>Status: <b>${esc(this.label())}</b>${this.lastSync ? ` · last saved ${this.lastSync.toLocaleTimeString()}` : ''}</div>
+        ${this.lastError ? `<div class="cs-err">${esc(this.lastError)}</div>` : ''}
+        <div class="cs-small">Edits show up on your other signed-in devices within a second or two. Edits made offline are kept and uploaded when you reconnect.</div>`;
+    },
+    open() {
+      if (this.state === 'link') { this.linkDialog(); return; }
+      if (this.state === 'unavailable') {
+        this.dialog({ title: 'Cloud sync', body: '<p>The sync service could not be loaded. Check your internet connection, then reload the page.</p>', actions: [{ label: 'Close' }, { label: 'Reload', cls: 'primary', onClick: () => location.reload() }] });
+        return;
+      }
+      if (!this.fs) { this.toast('Cloud sync is still loading…'); return; }
+      if (!this.user) { this.signInDialog(); return; }
+      this.dialog({
+        title: 'Cloud sync', body: `<div id="cs-info" style="display:grid;gap:6px">${this.infoHTML()}</div>`,
+        actions: [
+          { label: 'Sign out', cls: 'left', onClick: () => { this.signOut(); } },
+          { label: 'Close' },
+          { label: 'Sync now', cls: 'primary', onClick: () => { this.lastError = ''; this.push(); this.settle(); return false; } },
+        ],
+      });
+    },
+    signInDialog() {
+      const root = this.dialog({
+        title: 'Sign in to sync',
+        body: `<p class="cs-small">Use the account created in this app's Firebase project. Your data syncs to every device where you sign in.</p>
+          <label class="cs-field"><span>Email</span><input class="cs-input" type="email" id="cs-email" autocomplete="username" inputmode="email" autocapitalize="off" spellcheck="false"></label>
+          <label class="cs-field"><span>Password</span><input class="cs-input" type="password" id="cs-pass" autocomplete="current-password"></label>
+          <div class="cs-err" id="cs-err" role="alert"></div>
+          <div><button type="button" class="cs-btn link" id="cs-reset">Forgot password?</button></div>`,
+        actions: [{ label: 'Cancel' }, { label: 'Sign in', cls: 'primary', onClick: () => { this.signIn(); return false; } }],
+      });
+      root.querySelector('#cs-reset').onclick = () => this.resetPassword();
+      root.querySelector('#cs-pass').addEventListener('keydown', e => { if (e.key === 'Enter') this.signIn(); });
+    },
+    async signIn() {
+      const email = document.getElementById('cs-email').value.trim(), pass = document.getElementById('cs-pass').value, err = document.getElementById('cs-err');
+      if (!email || !pass) { err.textContent = 'Enter your email and password.'; return; }
+      err.textContent = 'Signing in…';
+      try { await this.authApi.signInWithEmailAndPassword(this.auth, email, pass); this.closeDialog(); this.toast('Signed in — syncing…'); }
+      catch (e) { const el = document.getElementById('cs-err'); if (el) el.textContent = this.authMsg(e); }
+    },
+    async resetPassword() {
+      const el = document.getElementById('cs-email'), err = document.getElementById('cs-err'), email = el ? el.value.trim() : '';
+      if (!email) { err.textContent = 'Type your email above first.'; return; }
+      try { await this.authApi.sendPasswordResetEmail(this.auth, email); err.textContent = 'If that account exists, a reset link has been sent to it.'; }
+      catch (e) { err.textContent = this.authMsg(e); }
+    },
+    authMsg(e) {
+      const c = (e && e.code) || '';
+      const M = {
+        'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.', 'auth/user-not-found': 'Wrong email or password.',
+        'auth/invalid-email': 'That email address is not valid.', 'auth/user-disabled': 'This account is disabled.',
+        'auth/too-many-requests': 'Too many attempts — wait a few minutes, then try again.',
+        'auth/network-request-failed': 'Cannot reach the sign-in server. Check your internet connection.',
+        'auth/operation-not-allowed': 'Email/password sign-in is not enabled in this Firebase project.',
+        'auth/unauthorized-domain': 'This website address is not in the Firebase project\'s authorized domains.',
+      };
+      return M[c] || `Sign-in failed (${c || (e && e.message) || 'unknown error'}).`;
+    },
+    async signOut() {
+      this.push();
+      try { await this.authApi.signOut(this.auth); this.toast('Signed out — your data stays on this device'); }
+      catch (e) { this.toast('Could not sign out', 'error'); }
+    },
+    // For confirm texts of destructive actions in the app.
+    note() { return this.user ? ' This also changes your cloud data, so every signed-in device follows.' : ''; },
+
+    /* ---------- tiny dialog + toast (independent of the host app) ---------- */
+    dialog({ title, body, actions = [{ label: 'Close' }], onClose }) {
+      this.closeDialog(true);
+      const bd = document.createElement('div');
+      bd.className = 'cs-backdrop cs-root';
+      bd.innerHTML = `<div class="cs-modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+        <div class="cs-head"><b>${esc(title)}</b><button type="button" class="cs-x" aria-label="Close">×</button></div>
+        <div class="cs-body">${body}</div>
+        <div class="cs-foot"></div></div>`;
+      const close = () => { this.closeDialog(); if (onClose) onClose(); };
+      bd._onClose = onClose;
+      bd.querySelector('.cs-x').onclick = close;
+      bd.addEventListener('mousedown', e => { if (e.target === bd) close(); });
+      const foot = bd.querySelector('.cs-foot');
+      actions.forEach(a => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'cs-btn ' + (a.cls || ''); b.textContent = a.label;
+        b.onclick = () => { const r = a.onClick ? a.onClick() : undefined; if (r !== false) this.closeDialog(); };
+        foot.appendChild(b);
+      });
+      document.body.appendChild(bd);
+      this._dlg = bd;
+      const first = bd.querySelector('.cs-input'); if (first) setTimeout(() => first.focus(), 50);
+      return bd;
+    },
+    closeDialog() { if (this._dlg) { this._dlg.remove(); this._dlg = null; } },
+    isDialogOpen() { return !!this._dlg; },
+    toast(msg, type) {
+      let box = document.querySelector('.cs-toasts');
+      if (!box) { box = document.createElement('div'); box.className = 'cs-toasts cs-root'; box.setAttribute('aria-live', 'polite'); document.body.appendChild(box); }
+      const t = document.createElement('div'); t.className = 'cs-toast' + (type ? ' ' + type : ''); t.textContent = msg;
+      box.appendChild(t); setTimeout(() => t.remove(), 3500);
+    },
+    _test: { strHash, docId, keyOf },
+  };
+  window.CloudSync = CloudSync;
+})();
+
+</script>
 <script>
 (function(){
 'use strict';
@@ -796,7 +1314,7 @@ const Store = {
   init(){
     this.available = storageAvailable();
     if (!this.available){
-      this.state = buildSampleState();
+      this.state = normalizedSample();
       showBanner('error', 'Browser storage (localStorage) is not available — for example in private mode or when site data is blocked. You can explore the app, but changes will NOT be kept after you close this page. Use Data → Export JSON backup to keep your work.');
       setSaveStatus('unavailable');
       return 'unavailable';
@@ -804,7 +1322,7 @@ const Store = {
     let raw = null;
     try { raw = localStorage.getItem(STORAGE_KEY); } catch(e){ raw = null; }
     if (raw === null){
-      this.state = buildSampleState();
+      this.state = normalizedSample();
       this.save();
       return 'seeded';
     }
@@ -834,6 +1352,7 @@ const Store = {
     try {
       this.state.meta.savedAt = nowISO();
       localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+      if (window.CloudSync && CloudSync.opts) CloudSync.changed();   // push to the cloud (no-op until signed in)
       // the write already succeeded; keep "Saving…" visible briefly so the change is noticeable
       this.timer = setTimeout(() => setSaveStatus('saved'), 380);
       return true;
@@ -1118,6 +1637,8 @@ function runAutoStatus(){
 /* =========================================================
    6. SAMPLE DATA (only when storage is empty, or on request)
    ========================================================= */
+/** Sample data passed through the same normalizer as saved/cloud data, so every device stores it identically. */
+function normalizedSample(){ const s = buildSampleState(), r = validateData(s); return r.fatal ? s : r.state; }
 function buildSampleState(){
   const st = emptyState();
   const T = D.today();
@@ -2116,7 +2637,7 @@ function showImportPreview(res, fileName){
   }
   const ns = res.state;
   Modal.open({ title:'Import backup', size:'sm',
-    body:`<p>The file <b>${esc(fileName)}</b> is a valid backup.</p><dl class="kv"><dt>Jobs</dt><dd>${ns.jobs.length}</dd><dt>Interview notes</dt><dd>${ns.notes.length}</dd><dt>Activity entries</dt><dd>${ns.activity.length}</dd><dt>Last saved</dt><dd>${ns.meta.savedAt ? D.fmtDT(ns.meta.savedAt) : '—'}</dd></dl><div class="callout warn"><b>Warning:</b> importing replaces ALL current data in this browser (${plural(st.jobs.length,'job')}, ${plural(st.notes.length,'interview note')}). This cannot be undone. Export your current data first if you might need it.</div>`,
+    body:`<p>The file <b>${esc(fileName)}</b> is a valid backup.</p><dl class="kv"><dt>Jobs</dt><dd>${ns.jobs.length}</dd><dt>Interview notes</dt><dd>${ns.notes.length}</dd><dt>Activity entries</dt><dd>${ns.activity.length}</dd><dt>Last saved</dt><dd>${ns.meta.savedAt ? D.fmtDT(ns.meta.savedAt) : '—'}</dd></dl><div class="callout warn"><b>Warning:</b> importing replaces ALL current data in this browser (${plural(st.jobs.length,'job')}, ${plural(st.notes.length,'interview note')}). This cannot be undone. Export your current data first if you might need it.</div>${syncNote()}`,
     footer:`<button type="button" class="btn" data-action="modal-close">Cancel</button><button type="button" class="btn" data-action="export">Export current data first</button><button type="button" class="btn btn-danger" id="confirmImportBtn">Replace current data</button>`,
     onMount: m => {
       $('#confirmImportBtn', m).onclick = async () => {
@@ -2131,11 +2652,11 @@ function showImportPreview(res, fileName){
 async function resetSampleFlow(){
   const st = S();
   if (st.jobs.length || st.notes.length){
-    const ok = await confirmDialog({ title:'Replace all data with sample data?', message:`<p>This permanently replaces your current <b>${plural(st.jobs.length,'job')}</b> and <b>${plural(st.notes.length,'interview note')}</b> (including status history and activity) with sample data.</p><p>Export a backup first if you might need them again.</p>`, confirmText:'Replace with sample data', danger:true });
+    const ok = await confirmDialog({ title:'Replace all data with sample data?', message:`<p>This permanently replaces your current <b>${plural(st.jobs.length,'job')}</b> and <b>${plural(st.notes.length,'interview note')}</b> (including status history and activity) with sample data.</p><p>Export a backup first if you might need them again.</p>${syncNote()}`, confirmText:'Replace with sample data', danger:true });
     if (!ok) return;
   }
   const settings = st.settings;
-  Store.state = buildSampleState();
+  Store.state = normalizedSample();
   Store.state.settings.theme = settings.theme;
   Store.state.settings.trackerView = settings.trackerView;
   Store.state.settings.notesView = settings.notesView;
@@ -2145,7 +2666,7 @@ async function resetSampleFlow(){
 }
 async function clearAllFlow(){
   const st = S();
-  const ok = await confirmDialog({ title:'Clear all data?', message:`<p>This permanently deletes <b>${plural(st.jobs.length,'job')}</b>, <b>${plural(st.notes.length,'interview note')}</b>, all status history and the activity log from this browser.</p><p>This cannot be undone. Export a backup first if you might need the data again.</p>`, confirmText:'Delete everything', danger:true });
+  const ok = await confirmDialog({ title:'Clear all data?', message:`<p>This permanently deletes <b>${plural(st.jobs.length,'job')}</b>, <b>${plural(st.notes.length,'interview note')}</b>, all status history and the activity log from this browser.</p><p>This cannot be undone. Export a backup first if you might need the data again.</p>${syncNote()}`, confirmText:'Delete everything', danger:true });
   if (!ok) return;
   const s = st.settings;
   Store.state = emptyState();
@@ -2435,6 +2956,7 @@ const Actions = {
     i.onchange = () => { const f = i.files[0]; if (!f) return; renderCvPicker(f.name); syncCvOpenBtn(); Modal.dirty = true; toast(`Linked to ${CV_DIR}/${f.name}. Make sure this file is saved in the ${CV_DIR} folder.`, 'info', { duration:7000 }); };
     i.click();
   },
+  'cloud-sync': () => { closeMenu(); if (window.CloudSync && CloudSync.opts) CloudSync.open(); else toast('Cloud sync is not available here. Open the app from its web link, or check your internet connection.', 'warn'); },
   'export': () => { closeMenu(); exportData(); },
   'import': () => { closeMenu(); const i = $('#importFile'); i.value = ''; i.click(); },
   'reset-sample': () => { closeMenu(); resetSampleFlow(); },
@@ -2538,6 +3060,68 @@ function tick(){
 }
 
 /* =========================================================
+   15b. CLOUD SYNC (Firebase — phone ↔ computer)
+   Each job and each interview note is its own cloud document, so two
+   devices editing different jobs never overwrite each other. The activity
+   log is stored per month. Theme and view choices stay per device.
+   ========================================================= */
+const FIREBASE_CONFIG = {   // public web config (not a secret — Firestore rules protect the data)
+  apiKey: 'AIzaSyAZryMRbozkS-owOagwJeHqRubGABb66NA',
+  authDomain: 'adrian-job-track.firebaseapp.com',
+  projectId: 'adrian-job-track',
+  storageBucket: 'adrian-job-track.firebasestorage.app',
+  messagingSenderId: '742908379990',
+  appId: '1:742908379990:web:4916324b8332590f4d8cf7'
+};
+function splitState(s){
+  const out = { version: s.version, settings: s.settings, jobOrder: s.jobs.map(j => j.id), noteOrder: s.notes.map(n => n.id) };
+  s.jobs.forEach(j => { out['job_'+j.id] = j; });
+  s.notes.forEach(n => { out['note_'+n.id] = n; });
+  s.activity.forEach(a => { const k = 'act_'+String(a.at).slice(0,7); (out[k] = out[k] || []).push(a); });
+  if (s.meta !== undefined) out.meta = s.meta;
+  return out;
+}
+function joinState(p){
+  const pick = (prefix, order) => {
+    const seen = new Set(), list = [];
+    (order || []).forEach(id => { const v = p[prefix+id]; if (v && !seen.has(id)){ seen.add(id); list.push(v); } });
+    Object.keys(p).filter(k => k.startsWith(prefix) && !seen.has(k.slice(prefix.length))).sort().forEach(k => list.push(p[k]));
+    return list;
+  };
+  const activity = [];
+  Object.keys(p).filter(k => k.startsWith('act_')).sort().forEach(k => { if (Array.isArray(p[k])) activity.push(...p[k]); });
+  const out = { version: p.version != null ? p.version : SCHEMA_VERSION, jobs: pick('job_', p.jobOrder), notes: pick('note_', p.noteOrder), activity, settings: p.settings || defaultSettings() };
+  if (p.meta !== undefined) out.meta = p.meta;
+  return out;
+}
+function initCloudSync(){
+  if (!window.CloudSync || !Store.available) return;
+  try {
+    CloudSync.init({
+      firebaseConfig: FIREBASE_CONFIG,
+      appName: 'Adrian Jobtrack',
+      getState: () => S(),
+      setState: s => {
+        const res = validateData(s);
+        if (res.fatal) return;
+        if (!res.state.meta || !res.state.meta.createdAt) res.state.meta = S().meta;
+        Store.state = res.state;
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Store.state)); } catch(e){}
+        applyTheme(); setSaveStatus('saved');
+      },
+      render: () => { renderAll(); updateCvUI(); },
+      isBusy: () => Modal.isOpen() || !$('#confirmRoot').hidden,
+      localOnly: ['settings.theme', 'settings.trackerView', 'settings.notesView', 'meta'],
+      describe: s => `${plural((s.jobs||[]).length,'job')}, ${plural((s.notes||[]).length,'interview note')}`,
+      split: splitState,
+      join: joinState,
+      mount: '#syncSlot'
+    });
+  } catch(e){ console.warn('Cloud sync could not start', e); }
+}
+const syncNote = () => (window.CloudSync && CloudSync.opts && CloudSync.note()) ? `<p>${esc(CloudSync.note().trim())}</p>` : '';
+
+/* =========================================================
    16. INIT
    ========================================================= */
 function init(){
@@ -2551,6 +3135,7 @@ function init(){
   if (result==='seeded') toast('Sample data loaded so you can explore. Use Data → Clear all data when you are ready to start fresh.', 'info', { duration:8000 });
   if (moved.length) notifyMoved(moved);
   CVFolder.init().then(updateCvUI).catch(() => {});
+  initCloudSync();
   if (missing.length) toast(`${plural(missing.length,'Applied job')} ${missing.length===1 ? 'has' : 'have'} no valid application date, so the 14-day rule skipped ${missing.length===1 ? 'it' : 'them'}. Please add the date.`, 'warn', { duration:8000, action:{ label:'Fix', fn:() => openJobModal(missing[0].id) } });
 }
 // debug/test hook (read-only helpers)
